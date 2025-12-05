@@ -1,0 +1,862 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  query, 
+  onSnapshot, 
+  doc, 
+  setDoc, 
+  addDoc, 
+  deleteDoc, 
+  updateDoc,
+  serverTimestamp,
+  setLogLevel // Added for debugging
+} from 'firebase/firestore';
+import { Loader2, Users, Dumbbell, UserCog, Home, Menu, X, Plus, Trash2, Edit3, Save, Briefcase, Calendar, Target } from 'lucide-react';
+
+// --- GLOBAL VARIABLES (Provided by Canvas Environment) ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Helper function for exponential backoff during API calls (though primarily for Gemini API, good practice for external fetch)
+const withExponentialBackoff = async (fn, maxRetries = 5) => {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt === maxRetries - 1) throw error;
+      const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+};
+
+// --- FIREBASE INITIALIZATION AND HOOKS ---
+
+// Set Firebase logging level for development visibility
+setLogLevel('debug');
+
+const useFirebase = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!firebaseConfig) {
+      console.error("Firebase config not available.");
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const app = initializeApp(firebaseConfig);
+      const _auth = getAuth(app);
+      const _db = getFirestore(app);
+
+      setAuth(_auth);
+      setDb(_db);
+
+      const unsubscribe = onAuthStateChanged(_auth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          setLoading(false);
+        } else {
+          // If no user, attempt sign-in
+          try {
+            if (initialAuthToken) {
+              await withExponentialBackoff(() => signInWithCustomToken(_auth, initialAuthToken));
+            } else {
+              await withExponentialBackoff(() => signInAnonymously(_auth));
+            }
+          } catch (error) {
+            console.error("Firebase sign-in failed:", error);
+            setLoading(false);
+          }
+        }
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error("Firebase initialization failed:", e);
+      setLoading(false);
+    }
+  }, []);
+
+  return { db, auth, userId, loading };
+};
+
+
+// --- CORE DATA HOOKS ---
+
+const useCollectionData = (db, userId, collectionName, isPublic = true) => {
+  const [data, setData] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (!db || !userId) {
+      setData([]);
+      setIsLoading(false);
+      return;
+    }
+
+    // Determine the collection path based on privacy
+    const path = isPublic
+      ? `artifacts/${appId}/public/data/${collectionName}`
+      : `artifacts/${appId}/users/${userId}/${collectionName}`;
+
+    const q = query(collection(db, path));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const items = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        // Ensure timestamp is converted to a readable string if present
+        createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate().toLocaleDateString() : 'N/A'
+      }));
+      // Sort in-memory (e.g., by name or creation date)
+      items.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      setData(items);
+      setIsLoading(false);
+      setError(null);
+    }, (e) => {
+      console.error(`Error fetching ${collectionName}:`, e);
+      setError(`Failed to load data for ${collectionName}.`);
+      setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [db, userId, collectionName, isPublic]);
+
+  return { data, isLoading, error, setData };
+};
+
+
+// --- UI COMPONENTS ---
+
+const Card = ({ children, className = '' }) => (
+  <div className={`p-6 bg-gray-800 rounded-xl shadow-lg border border-lime-500/20 ${className}`}>
+    {children}
+  </div>
+);
+
+const Button = ({ children, onClick, variant = 'primary', icon: Icon, disabled = false, className = '' }) => {
+  const baseStyle = "px-4 py-2 font-semibold text-white rounded-lg transition duration-200 flex items-center justify-center space-x-2";
+  let style;
+  switch (variant) {
+    case 'primary':
+      style = "bg-lime-600 hover:bg-lime-700 active:bg-lime-800 shadow-md shadow-lime-500/30";
+      break;
+    case 'secondary':
+      style = "bg-gray-600 hover:bg-gray-700 active:bg-gray-800";
+      break;
+    case 'danger':
+      style = "bg-red-600 hover:bg-red-700 active:bg-red-800";
+      break;
+    case 'ghost':
+      style = "bg-transparent text-lime-400 hover:bg-gray-700";
+      break;
+    default:
+      style = "bg-lime-600 hover:bg-lime-700 active:bg-lime-800";
+  }
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`${baseStyle} ${style} ${disabled ? 'opacity-50 cursor-not-allowed' : ''} ${className}`}
+    >
+      {Icon && <Icon className="w-5 h-5" />}
+      <span>{children}</span>
+    </button>
+  );
+};
+
+const InputField = ({ label, id, value, onChange, type = 'text', placeholder = '', required = false, className = '' }) => (
+  <div className={`flex flex-col space-y-1 ${className}`}>
+    <label htmlFor={id} className="text-sm font-medium text-gray-300">
+      {label} {required && <span className="text-red-500">*</span>}
+    </label>
+    <input
+      id={id}
+      type={type}
+      value={value}
+      onChange={onChange}
+      placeholder={placeholder}
+      required={required}
+      className="p-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-lime-500 focus:border-lime-500 transition duration-150"
+    />
+  </div>
+);
+
+const SelectField = ({ label, id, value, onChange, options, required = false, className = '' }) => (
+  <div className={`flex flex-col space-y-1 ${className}`}>
+    <label htmlFor={id} className="text-sm font-medium text-gray-300">
+      {label} {required && <span className="text-red-500">*</span>}
+    </label>
+    <select
+      id={id}
+      value={value}
+      onChange={onChange}
+      required={required}
+      className="p-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-lime-500 focus:border-lime-500 transition duration-150 appearance-none cursor-pointer"
+    >
+      {options.map((option, index) => (
+        <option key={index} value={option.value}>{option.label}</option>
+      ))}
+    </select>
+  </div>
+);
+
+const Modal = ({ isOpen, onClose, title, children }) => {
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 bg-opacity-75 transition-opacity duration-300">
+      <Card className="w-full max-w-lg mx-4 transition-transform duration-300 transform scale-100">
+        <div className="flex justify-between items-center border-b border-gray-700 pb-3 mb-4">
+          <h3 className="text-xl font-bold text-lime-400">{title}</h3>
+          <Button onClick={onClose} variant="ghost" icon={X} className="p-1 rounded-full text-gray-400 hover:text-white" />
+        </div>
+        <div>{children}</div>
+      </Card>
+    </div>
+  );
+};
+
+
+// --- FIREBASE CRUD OPERATIONS ---
+
+const createData = async (db, collectionName, data) => {
+  const path = `artifacts/${appId}/public/data/${collectionName}`;
+  const collectionRef = collection(db, path);
+  try {
+    const docRef = await withExponentialBackoff(() => addDoc(collectionRef, { ...data, createdAt: serverTimestamp() }));
+    return { success: true, id: docRef.id };
+  } catch (e) {
+    console.error(`Error adding document to ${collectionName}:`, e);
+    return { success: false, error: e.message };
+  }
+};
+
+const updateData = async (db, collectionName, id, data) => {
+  const path = `artifacts/${appId}/public/data/${collectionName}`;
+  const docRef = doc(db, path, id);
+  try {
+    await withExponentialBackoff(() => updateDoc(docRef, data));
+    return { success: true };
+  } catch (e) {
+    console.error(`Error updating document in ${collectionName}:`, e);
+    return { success: false, error: e.message };
+  }
+};
+
+const deleteData = async (db, collectionName, id) => {
+  const path = `artifacts/${appId}/public/data/${collectionName}`;
+  const docRef = doc(db, path, id);
+  try {
+    await withExponentialBackoff(() => deleteDoc(docRef));
+    return { success: true };
+  } catch (e) {
+    console.error(`Error deleting document in ${collectionName}:`, e);
+    return { success: false, error: e.message };
+  }
+};
+
+// --- VIEW COMPONENTS ---
+
+const LoadingScreen = () => (
+  <div className="flex items-center justify-center min-h-screen bg-gray-900 text-lime-400">
+    <Loader2 className="w-10 h-10 animate-spin mr-3" />
+    <span className="text-xl font-bold">Initializing NK FITNESS KENYA...</span>
+  </div>
+);
+
+const StatCard = ({ title, value, icon: Icon, colorClass = 'text-lime-400' }) => (
+  <Card className="flex items-center space-x-4">
+    <div className={`p-3 rounded-full ${colorClass} bg-gray-700`}>
+      <Icon className="w-6 h-6" />
+    </div>
+    <div>
+      <p className="text-sm font-medium text-gray-400">{title}</p>
+      <p className="text-3xl font-bold text-white">{value}</p>
+    </div>
+  </Card>
+);
+
+const Dashboard = ({ workers, clients, db }) => {
+  const totalClients = clients.length;
+  const totalWorkers = workers.length;
+  const activeClients = clients.filter(c => c.status === 'Active').length;
+  const trainers = workers.filter(w => w.role === 'Trainer').length;
+
+  // Simple In-memory data aggregation
+  const clientsByStatus = clients.reduce((acc, client) => {
+    acc[client.status] = (acc[client.status] || 0) + 1;
+    return acc;
+  }, {});
+
+  const clientsByTrainer = clients.reduce((acc, client) => {
+    const trainerName = workers.find(w => w.id === client.assignedTrainer)?.name || 'Unassigned';
+    acc[trainerName] = (acc[trainerName] || 0) + 1;
+    return acc;
+  }, {});
+
+  return (
+    <div className="space-y-8 p-4 md:p-8">
+      <h1 className="text-3xl font-extrabold text-white border-b border-gray-700 pb-2">
+        Admin Dashboard <span className="text-lime-400">({appId})</span>
+      </h1>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <StatCard title="Total Clients" value={totalClients} icon={Users} colorClass="text-lime-400" />
+        <StatCard title="Active Members" value={activeClients} icon={Dumbbell} colorClass="text-green-400" />
+        <StatCard title="Total Staff" value={totalWorkers} icon={Briefcase} colorClass="text-blue-400" />
+        <StatCard title="Trainers" value={trainers} icon={UserCog} colorClass="text-yellow-400" />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card>
+          <h2 className="text-xl font-bold text-white mb-4 border-b border-gray-700 pb-2">Client Status Overview</h2>
+          <div className="space-y-3">
+            {Object.entries(clientsByStatus).map(([status, count]) => (
+              <div key={status} className="flex justify-between items-center text-gray-300">
+                <span className="font-medium">{status}</span>
+                <span className="text-lg font-bold text-lime-400">{count}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+
+        <Card>
+          <h2 className="text-xl font-bold text-white mb-4 border-b border-gray-700 pb-2">Clients per Trainer</h2>
+          <div className="space-y-3">
+            {Object.entries(clientsByTrainer).map(([trainer, count]) => (
+              <div key={trainer} className="flex justify-between items-center text-gray-300">
+                <span className="font-medium">{trainer}</span>
+                <span className="text-lg font-bold text-lime-400">{count}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+
+      <p className="text-sm text-gray-500 pt-4">
+        *Data is sourced live from Firestore collection: `artifacts/{appId}/public/data/...`
+      </p>
+    </div>
+  );
+};
+
+
+// --- WORKER MANAGEMENT ---
+
+const WorkerManager = ({ db, workers, isLoading, error }) => {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [currentWorker, setCurrentWorker] = useState(null);
+  const [formState, setFormState] = useState({ name: '', role: 'Trainer', email: '', phone: '' });
+  const [isSaving, setIsSaving] = useState(false);
+
+  const roles = [
+    { value: 'Trainer', label: 'Trainer' },
+    { value: 'Administrator', label: 'Administrator' },
+    { value: 'Support', label: 'Support Staff' }
+  ];
+
+  const handleOpenModal = (worker = null) => {
+    setCurrentWorker(worker);
+    if (worker) {
+      setFormState({ name: worker.name, role: worker.role, email: worker.email, phone: worker.phone });
+    } else {
+      setFormState({ name: '', role: 'Trainer', email: '', phone: '' });
+    }
+    setIsModalOpen(true);
+  };
+
+  const handleChange = (e) => {
+    const { id, value } = e.target;
+    setFormState(prev => ({ ...prev, [id]: value }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!db) return;
+    setIsSaving(true);
+
+    let result;
+    if (currentWorker) {
+      result = await updateData(db, 'workers', currentWorker.id, formState);
+    } else {
+      result = await createData(db, 'workers', formState);
+    }
+
+    if (result.success) {
+      setIsModalOpen(false);
+    } else {
+      console.error("Save failed:", result.error);
+    }
+    setIsSaving(false);
+  };
+
+  const handleDelete = async (workerId) => {
+    if (!db || !window.confirm("Are you sure you want to delete this worker? This action cannot be undone.")) return;
+    await deleteData(db, 'workers', workerId);
+  };
+
+  return (
+    <div className="p-4 md:p-8">
+      <div className="flex justify-between items-center mb-6 border-b border-gray-700 pb-4">
+        <h1 className="text-3xl font-extrabold text-white">Staff Management</h1>
+        <Button onClick={() => handleOpenModal(null)} icon={Plus}>Add New Worker</Button>
+      </div>
+
+      {isLoading && <p className="text-gray-400 flex items-center"><Loader2 className="w-5 h-5 animate-spin mr-2" /> Loading staff data...</p>}
+      {error && <p className="text-red-500">Error: {error}</p>}
+
+      <Card className="mt-4 overflow-x-auto">
+        <table className="min-w-full divide-y divide-gray-700">
+          <thead>
+            <tr className="text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+              <th className="px-4 py-3">Name</th>
+              <th className="px-4 py-3">Role</th>
+              <th className="px-4 py-3">Email</th>
+              <th className="px-4 py-3">Phone</th>
+              <th className="px-4 py-3">Joined</th>
+              <th className="px-4 py-3 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-800 text-sm">
+            {workers.map((worker) => (
+              <tr key={worker.id} className="hover:bg-gray-700 transition duration-150">
+                <td className="px-4 py-4 font-medium text-white">{worker.name}</td>
+                <td className="px-4 py-4 text-lime-400">{worker.role}</td>
+                <td className="px-4 py-4 text-gray-300">{worker.email}</td>
+                <td className="px-4 py-4 text-gray-300">{worker.phone}</td>
+                <td className="px-4 py-4 text-gray-400">{worker.createdAt}</td>
+                <td className="px-4 py-4 text-right whitespace-nowrap space-x-2">
+                  <Button variant="secondary" icon={Edit3} onClick={() => handleOpenModal(worker)} className="p-2 w-10 h-10" />
+                  <Button variant="danger" icon={Trash2} onClick={() => handleDelete(worker.id)} className="p-2 w-10 h-10" />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={currentWorker ? 'Edit Worker' : 'Add New Worker'}>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <InputField id="name" label="Full Name" value={formState.name} onChange={handleChange} required />
+          <SelectField
+            id="role"
+            label="Role"
+            value={formState.role}
+            onChange={handleChange}
+            options={roles}
+            required
+          />
+          <InputField id="email" label="Email" type="email" value={formState.email} onChange={handleChange} />
+          <InputField id="phone" label="Phone" value={formState.phone} onChange={handleChange} />
+
+          <div className="pt-4 flex justify-end space-x-3">
+            <Button variant="secondary" onClick={() => setIsModalOpen(false)} disabled={isSaving}>Cancel</Button>
+            <Button type="submit" icon={Save} disabled={isSaving}>
+              {isSaving ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" /> Saving...
+                </>
+              ) : (
+                currentWorker ? 'Update Worker' : 'Create Worker'
+              )}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+    </div>
+  );
+};
+
+// --- CLIENT MANAGEMENT ---
+
+const ClientManager = ({ db, clients, workers, isLoading, error }) => {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [currentClient, setCurrentClient] = useState(null);
+  const [formState, setFormState] = useState({
+    name: '',
+    email: '',
+    phone: '',
+    status: 'Pending',
+    membership: 'Bronze',
+    assignedTrainer: '',
+    goal: 'Weight Loss'
+  });
+  const [isSaving, setIsSaving] = useState(false);
+
+  const statusOptions = [{ value: 'Active', label: 'Active' }, { value: 'Pending', label: 'Pending' }, { value: 'Paused', label: 'Paused' }, { value: 'Canceled', label: 'Canceled' }];
+  const membershipOptions = [{ value: 'Bronze', label: 'Bronze' }, { value: 'Silver', label: 'Silver' }, { value: 'Gold', label: 'Gold' }, { value: 'Platinum', label: 'Platinum' }];
+  const goalOptions = [{ value: 'Weight Loss', label: 'Weight Loss' }, { value: 'Muscle Gain', label: 'Muscle Gain' }, { value: 'Endurance', label: 'Endurance' }, { value: 'Rehabilitation', label: 'Rehabilitation' }];
+  
+  const trainerOptions = useMemo(() => {
+    return [{ value: '', label: 'Unassigned' }].concat(
+      workers.filter(w => w.role === 'Trainer').map(w => ({ value: w.id, label: w.name }))
+    );
+  }, [workers]);
+
+  const getTrainerName = (trainerId) => workers.find(w => w.id === trainerId)?.name || 'Unassigned';
+
+  const handleOpenModal = (client = null) => {
+    setCurrentClient(client);
+    if (client) {
+      setFormState({
+        name: client.name,
+        email: client.email,
+        phone: client.phone,
+        status: client.status,
+        membership: client.membership,
+        assignedTrainer: client.assignedTrainer || '',
+        goal: client.goal
+      });
+    } else {
+      setFormState({
+        name: '',
+        email: '',
+        phone: '',
+        status: 'Active',
+        membership: 'Bronze',
+        assignedTrainer: '',
+        goal: 'Weight Loss'
+      });
+    }
+    setIsModalOpen(true);
+  };
+
+  const handleChange = (e) => {
+    const { id, value } = e.target;
+    setFormState(prev => ({ ...prev, [id]: value }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!db) return;
+    setIsSaving(true);
+
+    let result;
+    const clientData = { ...formState };
+
+    if (currentClient) {
+      result = await updateData(db, 'clients', currentClient.id, clientData);
+    } else {
+      result = await createData(db, 'clients', clientData);
+    }
+
+    if (result.success) {
+      setIsModalOpen(false);
+    } else {
+      console.error("Save failed:", result.error);
+    }
+    setIsSaving(false);
+  };
+
+  const handleDelete = async (clientId) => {
+    if (!db || !window.confirm("Are you sure you want to delete this client record?")) return;
+    await deleteData(db, 'clients', clientId);
+  };
+
+  const getStatusColor = (status) => {
+    switch(status) {
+      case 'Active': return 'bg-green-500/20 text-green-400 border-green-500/50';
+      case 'Pending': return 'bg-yellow-500/20 text-yellow-400 border-yellow-500/50';
+      case 'Paused': return 'bg-blue-500/20 text-blue-400 border-blue-500/50';
+      case 'Canceled': return 'bg-red-500/20 text-red-400 border-red-500/50';
+      default: return 'bg-gray-500/20 text-gray-400 border-gray-500/50';
+    }
+  };
+
+  return (
+    <div className="p-4 md:p-8">
+      <div className="flex justify-between items-center mb-6 border-b border-gray-700 pb-4">
+        <h1 className="text-3xl font-extrabold text-white">Client Management</h1>
+        <Button onClick={() => handleOpenModal(null)} icon={Plus}>Add New Client</Button>
+      </div>
+
+      {isLoading && <p className="text-gray-400 flex items-center"><Loader2 className="w-5 h-5 animate-spin mr-2" /> Loading client data...</p>}
+      {error && <p className="text-red-500">Error: {error}</p>}
+
+      <Card className="mt-4 overflow-x-auto">
+        <table className="min-w-full divide-y divide-gray-700">
+          <thead>
+            <tr className="text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+              <th className="px-4 py-3">Client Name</th>
+              <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">Membership</th>
+              <th className="px-4 py-3">Trainer</th>
+              <th className="px-4 py-3">Goal</th>
+              <th className="px-4 py-3 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-800 text-sm">
+            {clients.map((client) => (
+              <tr key={client.id} className="hover:bg-gray-700 transition duration-150">
+                <td className="px-4 py-4 font-medium text-white">{client.name}</td>
+                <td className="px-4 py-4">
+                  <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${getStatusColor(client.status)}`}>
+                    {client.status}
+                  </span>
+                </td>
+                <td className="px-4 py-4 text-lime-300">{client.membership}</td>
+                <td className="px-4 py-4 text-gray-300">{getTrainerName(client.assignedTrainer)}</td>
+                <td className="px-4 py-4 text-gray-400">{client.goal}</td>
+                <td className="px-4 py-4 text-right whitespace-nowrap space-x-2">
+                  <Button variant="secondary" icon={Edit3} onClick={() => handleOpenModal(client)} className="p-2 w-10 h-10" />
+                  <Button variant="danger" icon={Trash2} onClick={() => handleDelete(client.id)} className="p-2 w-10 h-10" />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={currentClient ? 'Edit Client Record' : 'Add New Client'}>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <InputField id="name" label="Full Name" value={formState.name} onChange={handleChange} required />
+          <div className="grid grid-cols-2 gap-4">
+            <InputField id="email" label="Email" type="email" value={formState.email} onChange={handleChange} />
+            <InputField id="phone" label="Phone" value={formState.phone} onChange={handleChange} />
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
+            <SelectField id="status" label="Status" value={formState.status} onChange={handleChange} options={statusOptions} required />
+            <SelectField id="membership" label="Membership" value={formState.membership} onChange={handleChange} options={membershipOptions} required />
+            <SelectField id="goal" label="Fitness Goal" value={formState.goal} onChange={handleChange} options={goalOptions} required />
+          </div>
+
+          <SelectField
+            id="assignedTrainer"
+            label="Assigned Trainer"
+            value={formState.assignedTrainer}
+            onChange={handleChange}
+            options={trainerOptions}
+          />
+
+          <div className="pt-4 flex justify-end space-x-3">
+            <Button variant="secondary" onClick={() => setIsModalOpen(false)} disabled={isSaving}>Cancel</Button>
+            <Button type="submit" icon={Save} disabled={isSaving}>
+              {isSaving ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" /> Saving...
+                </>
+              ) : (
+                currentClient ? 'Update Client' : 'Create Client'
+              )}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+    </div>
+  );
+};
+
+
+const PublicHomePage = ({ setCurrentPage, auth, userId }) => {
+    const handleLogout = () => {
+        if (auth) {
+            signOut(auth);
+            // Optionally reload or navigate to ensure state is clean
+        }
+    }
+
+    return (
+        <div className="min-h-screen bg-gray-900 text-white font-inter">
+            {/* Header / Nav */}
+            <header className="bg-gray-800/80 backdrop-blur-sm sticky top-0 z-10 border-b border-lime-500/20">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                    <h1 className="text-3xl font-extrabold text-lime-400">NK FITNESS KENYA</h1>
+                    <div className="space-x-4 flex items-center">
+                        {userId && (
+                             <Button onClick={() => setCurrentPage('dashboard')} variant="ghost" icon={Briefcase}>
+                                Management Portal
+                            </Button>
+                        )}
+                        <Button onClick={() => setCurrentPage('dashboard')} variant="primary" icon={Dumbbell}>
+                            Get Started
+                        </Button>
+                        {auth && (
+                            <Button onClick={handleLogout} variant="danger" className="ml-4">
+                                Sign Out
+                            </Button>
+                        )}
+                    </div>
+                </div>
+            </header>
+
+            {/* Hero Section */}
+            <section className="relative h-[60vh] flex items-center justify-center text-center bg-cover bg-center" style={{ backgroundImage: "url('https://placehold.co/1920x800/1e293b/d9f99d?text=World-Class+Fitness+in+Kenya')" }}>
+                <div className="absolute inset-0 bg-black/70"></div>
+                <div className="z-10 p-4 max-w-4xl">
+                    <h2 className="text-5xl md:text-7xl font-black mb-4 text-white drop-shadow-lg">
+                        Train <span className="text-lime-400">Smarter</span>, Not Just Harder.
+                    </h2>
+                    <p className="text-xl text-gray-300 mb-8">
+                        Your premier partner for professional training, personalized plans, and measurable results.
+                    </p>
+                    <Button onClick={() => setCurrentPage('dashboard')} className="px-8 py-3 text-lg" icon={Target}>
+                        View Our Services
+                    </Button>
+                </div>
+            </section>
+
+            {/* Services Section */}
+            <section className="py-20 bg-gray-900">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                    <h2 className="text-4xl font-extrabold text-center mb-12 text-white">Our Signature Services</h2>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                        <Card>
+                            <UserCog className="w-10 h-10 text-lime-400 mb-4" />
+                            <h3 className="text-xl font-bold mb-2">Personal Training</h3>
+                            <p className="text-gray-400">One-on-one sessions with our certified experts focused entirely on your unique goals and progress tracking.</p>
+                        </Card>
+                        <Card>
+                            <Calendar className="w-10 h-10 text-lime-400 mb-4" />
+                            <h3 className="text-xl font-bold mb-2">Group Classes</h3>
+                            <p className="text-gray-400">High-energy fitness classes, from HIIT to Yoga, designed to build community and maximize calorie burn.</p>
+                        </Card>
+                        <Card>
+                            <Target className="w-10 h-10 text-lime-400 mb-4" />
+                            <h3 className="text-xl font-bold mb-2">Nutrition Coaching</h3>
+                            {/* FIX: Removed duplicate 'className' attribute */}
+                            <p className="text-gray-400">Customized meal plans and ongoing support to fuel your body correctly and achieve sustainable results.</p>
+                        </Card>
+                    </div>
+                </div>
+            </section>
+
+            {/* Contact Form Placeholder */}
+            <section className="py-20 bg-gray-800">
+                <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+                    <h2 className="text-4xl font-extrabold mb-4 text-lime-400">Ready to Transform?</h2>
+                    <p className="text-gray-300 mb-8">Contact us today to schedule your free consultation.</p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <InputField label="Name" id="contact-name" placeholder="Your Name" />
+                        <InputField label="Email" id="contact-email" type="email" placeholder="you@example.com" />
+                    </div>
+                    <div className="mt-4">
+                        <textarea
+                            className="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-lime-500 focus:border-lime-500 transition duration-150 h-32"
+                            placeholder="Your message..."
+                        ></textarea>
+                    </div>
+                    <Button className="mt-6 w-full py-3 text-lg" icon={Save}>Send Inquiry</Button>
+                </div>
+            </section>
+
+            {/* Footer */}
+            <footer className="bg-gray-900 border-t border-gray-700/50 py-8">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-gray-500">
+                    <p>&copy; {new Date().getFullYear()} NK FITNESS KENYA. All Rights Reserved.</p>
+                    <p className="text-xs mt-2">Built with Apex Management System ({appId}).</p>
+                </div>
+            </footer>
+        </div>
+    )
+}
+
+
+// --- MAIN APP COMPONENT ---
+
+const App = () => {
+  const { db, auth, userId, loading } = useFirebase();
+  const { data: workers, isLoading: workersLoading, error: workersError } = useCollectionData(db, userId, 'workers', true);
+  const { data: clients, isLoading: clientsLoading, error: clientsError } = useCollectionData(db, userId, 'clients', true);
+  const [currentPage, setCurrentPage] = useState('home');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
+  // Determine if all necessary data is loaded for the admin panel
+  const isDataReady = db && userId && !loading && !workersLoading && !clientsLoading;
+
+  if (loading) {
+    return <LoadingScreen />;
+  }
+
+  const navItems = [
+    { name: 'Home (Public)', icon: Home, page: 'home' },
+    { name: 'Dashboard', icon: Briefcase, page: 'dashboard', admin: true },
+    { name: 'Client Manager', icon: Users, page: 'clients', admin: true },
+    { name: 'Staff Manager', icon: UserCog, page: 'workers', admin: true },
+  ];
+
+  const Sidebar = () => (
+    <div className={`fixed top-0 left-0 h-full w-64 bg-gray-800 z-40 transform transition-transform duration-300 ease-in-out lg:translate-x-0 ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+      <div className="p-6">
+        <div className="flex justify-between items-center mb-8">
+          <h2 className="text-xl font-extrabold text-lime-400">Apex Control</h2>
+          <Button variant="ghost" icon={X} onClick={() => setIsSidebarOpen(false)} className="lg:hidden" />
+        </div>
+        <p className="text-xs text-gray-500 mb-4 truncate">User ID: {userId}</p>
+        <nav className="space-y-2">
+          {navItems.map((item) => (
+            <Button
+              key={item.page}
+              onClick={() => {
+                setCurrentPage(item.page);
+                setIsSidebarOpen(false);
+              }}
+              variant={currentPage === item.page ? 'primary' : 'secondary'}
+              icon={item.icon}
+              className="w-full justify-start"
+            >
+              {item.name}
+            </Button>
+          ))}
+        </nav>
+      </div>
+      <div className="absolute bottom-0 w-full p-4 border-t border-gray-700">
+        <Button onClick={() => signOut(auth)} variant="danger" className="w-full">Sign Out</Button>
+      </div>
+    </div>
+  );
+
+  const Header = () => (
+    <header className="bg-gray-800 p-4 shadow-md flex justify-between items-center lg:hidden">
+      <Button variant="ghost" icon={Menu} onClick={() => setIsSidebarOpen(true)} className="text-white" />
+      <h1 className="text-xl font-extrabold text-lime-400">NK FITNESS</h1>
+      <div className="w-10 h-10"></div> {/* Spacer */}
+    </header>
+  );
+
+  const renderPage = () => {
+    switch (currentPage) {
+      case 'dashboard':
+        return isDataReady ? <Dashboard workers={workers} clients={clients} db={db} /> : <LoadingScreen />;
+      case 'clients':
+        return isDataReady ? <ClientManager db={db} clients={clients} workers={workers} isLoading={clientsLoading} error={clientsError} /> : <LoadingScreen />;
+      case 'workers':
+        return isDataReady ? <WorkerManager db={db} workers={workers} isLoading={workersLoading} error={workersError} /> : <LoadingScreen />;
+      case 'home':
+      default:
+        return <PublicHomePage setCurrentPage={setCurrentPage} auth={auth} userId={userId} />;
+    }
+  };
+
+  // If the user is authenticated, we show the management view with a sidebar
+  if (userId) {
+    return (
+      <div className="flex min-h-screen bg-gray-900 font-inter text-white">
+        <Sidebar />
+        <div className="flex-1 lg:ml-64 flex flex-col">
+            <Header />
+            <main className="flex-1 overflow-y-auto">
+              {renderPage()}
+            </main>
+        </div>
+      </div>
+    );
+  }
+
+  // Fallback for unauthenticated users (should be rare due to auto-sign-in)
+  return <PublicHomePage setCurrentPage={setCurrentPage} auth={auth} userId={userId} />;
+};
+
+export default App;
