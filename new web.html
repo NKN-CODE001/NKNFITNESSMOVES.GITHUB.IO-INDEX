@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NK-N Health & Fitness Kenya: Online Hub</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fc;
+        }
+        /* Custom scrollbar for a cleaner look */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #4f46e5; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #3730a3; }
+    </style>
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        let db;
+        let auth;
+        let userId = 'loading';
+        let appId = 'default-app-id';
+
+        // 1. Initial Setup
+        const initializeFirebase = async () => {
+            try {
+                appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+                if (Object.keys(firebaseConfig).length === 0) {
+                    console.error("Firebase config is missing or empty. Using default data models.");
+                    document.getElementById('firebase-status').textContent = 'Database: Local Simulation (Config Missing)';
+                    renderApp(); // Render without DB functions
+                    return;
+                }
+                
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 2. Authentication
+                const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // 3. Auth State Listener & Rendering
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('firebase-status').textContent = `Database: Active (User: ${userId.substring(0, 8)}...)`;
+                        document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                        // Start real-time listeners after authentication
+                        setupDashboardListeners();
+                    } else {
+                        userId = 'guest';
+                        document.getElementById('firebase-status').textContent = 'Database: Signed Out/Guest';
+                    }
+                    renderApp();
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization or sign-in failed:", error);
+                document.getElementById('firebase-status').textContent = 'Database: Error';
+                renderApp();
+            }
+        };
+
+        // --- Dashboard Functionality (Firestore) ---
+
+        // Helper to get the correct collection path
+        const getProgressCollectionRef = () => {
+            if (!db || userId === 'guest') return null;
+            // Private User Data Path: /artifacts/{appId}/users/{userId}/progress_tracker
+            return collection(db, `artifacts/${appId}/users/${userId}/progress_tracker`);
+        };
+
+        // 4. Log Progress
+        window.logProgress = async (weight, note) => {
+            const progressRef = getProgressCollectionRef();
+            if (!progressRef) {
+                showMessage("Dashboard not active. Please sign in or check config.", 'error');
+                return;
+            }
+
+            const data = {
+                weight: parseFloat(weight),
+                note: note || 'No notes',
+                timestamp: serverTimestamp()
+            };
+
+            try {
+                await addDoc(progressRef, data);
+                showMessage("Progress logged successfully!", 'success');
+                document.getElementById('progress-form').reset();
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                showMessage(`Error logging progress: ${e.message}`, 'error');
+            }
+        };
+
+        // 5. Setup Real-time Listener for Dashboard Data
+        const setupDashboardListeners = () => {
+            const progressRef = getProgressCollectionRef();
+            if (!progressRef) return;
+            
+            // Query for up to 10 latest records
+            const q = query(progressRef); 
+
+            onSnapshot(q, (snapshot) => {
+                const logsContainer = document.getElementById('progress-logs');
+                logsContainer.innerHTML = '';
+                
+                if (snapshot.empty) {
+                    logsContainer.innerHTML = '<p class="text-gray-500 italic">No progress logs found. Log your first entry!</p>';
+                    return;
+                }
+
+                const logs = [];
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    logs.push({ 
+                        id: doc.id, 
+                        weight: data.weight, 
+                        note: data.note, 
+                        timestamp: data.timestamp ? data.timestamp.toDate() : new Date() 
+                    });
+                });
+                
+                // Sort by timestamp descending (latest first)
+                logs.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+                logs.forEach(log => {
+                    const dateString = log.timestamp.toLocaleDateString('en-KE', { 
+                        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' 
+                    });
+                    const logItem = `
+                        <div class="bg-white p-4 rounded-xl shadow-sm mb-3 border border-indigo-100">
+                            <p class="font-semibold text-indigo-600">Weight: ${log.weight} kg</p>
+                            <p class="text-sm text-gray-700 mt-1">${log.note}</p>
+                            <p class="text-xs text-gray-400 mt-2">Logged on: ${dateString}</p>
+                        </div>
+                    `;
+                    logsContainer.innerHTML += logItem;
+                });
+            }, (error) => {
+                console.error("Error setting up snapshot listener:", error);
+                document.getElementById('progress-logs').innerHTML = `<p class="text-red-500">Error loading data: ${error.message}</p>`;
+            });
+        };
+
+        // --- UI & Rendering Logic ---
+
+        const showMessage = (message, type = 'info') => {
+            const container = document.getElementById('message-box');
+            container.innerHTML = `<div class="p-3 mb-4 rounded-xl text-sm ${type === 'success' ? 'bg-green-100 text-green-700' : type === 'error' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}">${message}</div>`;
+            setTimeout(() => container.innerHTML = '', 5000);
+        };
+
+        window.toggleView = (view) => {
+            document.getElementById('public-view').classList.add('hidden');
+            document.getElementById('dashboard-view').classList.add('hidden');
+            
+            document.getElementById(`${view}-view`).classList.remove('hidden');
+            
+            // Update active state in nav
+            document.querySelectorAll('.nav-link').forEach(link => {
+                link.classList.remove('bg-indigo-700', 'text-white');
+                link.classList.add('text-indigo-200', 'hover:text-white');
+            });
+            const activeLink = document.querySelector(`[onclick="toggleView('${view}')"]`);
+             if (activeLink) {
+                activeLink.classList.add('bg-indigo-700', 'text-white');
+                activeLink.classList.remove('text-indigo-200', 'hover:text-white');
+             }
+        };
+
+        const renderApp = () => {
+            const isDashboard = window.location.hash === '#dashboard' && userId !== 'guest' && db;
+            
+            // Render the main content based on the hash/state
+            if (isDashboard) {
+                toggleView('dashboard');
+            } else {
+                toggleView('public');
+            }
+        };
+        
+        // Expose functions globally for HTML access
+        window.initializeFirebase = initializeFirebase;
+        window.showMessage = showMessage;
+        window.signOutUser = async () => {
+            if (auth) {
+                try {
+                    await signOut(auth);
+                    showMessage("You have signed out successfully.", 'info');
+                    window.location.hash = '#public';
+                    renderApp();
+                } catch (error) {
+                    showMessage(`Sign out failed: ${error.message}`, 'error');
+                }
+            }
+        };
+
+        // Start everything on load
+        window.onload = initializeFirebase;
+    </script>
+</head>
+<body>
+
+    <!-- Header & Navigation -->
+    <header class="bg-indigo-600 shadow-lg sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+            <!-- Logo & Brand Name -->
+            <div class="flex items-center space-x-3">
+                <svg class="w-8 h-8 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9h2c1 0 1 3 3 3 1.5 0 3-2 3-3s-1.5-3-3-3-3 2-3 3zm12-3h-2c-1 0-1 3-3 3-1.5 0-3-2-3-3s1.5-3 3-3 3 2 3 3z"></path></svg>
+                <h1 class="text-2xl font-bold tracking-tight text-white">NK-N Fitness <span class="text-teal-400">Kenya</span></h1>
+            </div>
+
+            <!-- Navigation Links (Dynamic) -->
+            <nav class="hidden md:flex space-x-4">
+                <button onclick="toggleView('public'); window.location.hash = '#public';" class="nav-link px-3 py-2 rounded-lg text-sm font-medium bg-indigo-700 text-white transition duration-150">Home</button>
+                <button onclick="toggleView('public'); document.getElementById('services-section').scrollIntoView({ behavior: 'smooth' });" class="nav-link px-3 py-2 rounded-lg text-sm font-medium text-indigo-200 hover:text-white transition duration-150">Services</button>
+                <button onclick="toggleView('public'); document.getElementById('blog-section').scrollIntoView({ behavior: 'smooth' });" class="nav-link px-3 py-2 rounded-lg text-sm font-medium text-indigo-200 hover:text-white transition duration-150">Blog</button>
+                
+                <div id="auth-actions">
+                    <!-- Dynamic button based on auth state (rendered via JS) -->
+                    <button id="dashboard-btn" onclick="toggleView('dashboard'); window.location.hash = '#dashboard';" class="nav-link px-3 py-2 rounded-lg text-sm font-medium text-white bg-teal-500 hover:bg-teal-600 transition duration-150 shadow-md hidden">
+                        Client Dashboard
+                    </button>
+                    <button id="signout-btn" onclick="signOutUser()" class="nav-link px-3 py-2 rounded-lg text-sm font-medium text-indigo-200 hover:text-white transition duration-150 hidden">
+                        Sign Out
+                    </button>
+                </div>
+            </nav>
+            
+            <!-- Mobile Menu Button (Hamburger) - Omitted for brevity in this simple implementation, focusing on core views -->
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- Message Box for Alerts -->
+        <div id="message-box"></div>
+        <div class="text-xs text-right text-gray-400 mb-4" id="firebase-status">Database: Initializing...</div>
+
+        <!-- Dynamic Content Views -->
+        <div id="public-view" class="hidden">
+            
+            <!-- Hero Section -->
+            <section class="mb-16 bg-white p-8 sm:p-12 rounded-3xl shadow-2xl border-b-4 border-teal-400">
+                <div class="lg:flex lg:items-center lg:justify-between">
+                    <div class="lg:w-1/2">
+                        <span class="text-sm font-semibold text-teal-500 uppercase tracking-wider">Your Health, Your Life, Your Kenya</span>
+                        <h2 class="mt-4 text-5xl sm:text-6xl font-extrabold text-indigo-900 leading-tight">
+                            Achieve <span class="text-teal-500">Lifelong Vitality</span> with NK-N
+                        </h2>
+                        <p class="mt-6 text-lg text-gray-600 max-w-lg">
+                            We are Kenya's dedicated partner in personalized fitness and holistic wellness. Start your transformation today with programs built for the local lifestyle.
+                        </p>
+                        <div class="mt-10 flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4">
+                            <a href="#services" class="bg-indigo-600 text-white py-3 px-8 rounded-full text-lg font-semibold hover:bg-indigo-700 transition duration-300 shadow-xl transform hover:scale-[1.02] text-center">
+                                View Our Programs
+                            </a>
+                            <a href="#contact" class="bg-gray-100 text-indigo-600 py-3 px-8 rounded-full text-lg font-semibold hover:bg-gray-200 transition duration-300 shadow-md text-center">
+                                Book a Free Trial
+                            </a>
+                        </div>
+                    </div>
+                    <div class="lg:w-1/2 mt-10 lg:mt-0">
+                        <!-- Placeholder for a high-quality, local image/video -->
+                        <div class="bg-indigo-100 rounded-3xl h-64 sm:h-80 flex items-center justify-center text-indigo-700 font-medium border-4 border-dashed border-indigo-300">
+                            High-Quality Image/Video: Trainers and Clients in Action
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Services Section -->
+            <section id="services-section" class="py-16">
+                <h3 class="text-4xl font-extrabold text-indigo-900 text-center mb-12">Our Core Services</h3>
+                <div class="grid md:grid-cols-3 gap-8">
+                    <!-- Service 1: Personal Training -->
+                    <div class="bg-white p-8 rounded-2xl shadow-xl border-t-4 border-indigo-600">
+                        <div class="text-indigo-600 mb-4">
+                            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zm-8 4a2 2 0 100-4 2 2 0 000 4z"></path></svg>
+                        </div>
+                        <h4 class="text-xl font-semibold text-indigo-900 mb-3">1:1 Personalized Training</h4>
+                        <p class="text-gray-600">Bespoke training plans designed by certified Kenyan trainers to meet your specific goals, lifestyle, and fitness level. Maximize your results.</p>
+                    </div>
+                    <!-- Service 2: Group Classes -->
+                    <div class="bg-white p-8 rounded-2xl shadow-xl border-t-4 border-teal-500">
+                        <div class="text-teal-600 mb-4">
+                            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H9a1 1 0 01-1-1v-1a4 4 0 00-4-4H3m7-2h1.414c.538 0 .756.248.807.747l.85 5.567a1 1 0 01-.98 1.189H10a1 1 0 01-.98-1.189l.85-5.567c.05-.499.27-.747.807-.747H10zM21 12.5a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"></path></svg>
+                        </div>
+                        <h4 class="text-xl font-semibold text-indigo-900 mb-3">Community Group Classes</h4>
+                        <p class="text-gray-600">High-energy sessions from Zumba and Spin to Yoga. Build motivation and meet your goals in a supportive, vibrant Kenyan community setting.</p>
+                    </div>
+                    <!-- Service 3: Nutrition Coaching -->
+                    <div class="bg-white p-8 rounded-2xl shadow-xl border-t-4 border-indigo-600">
+                        <div class="text-indigo-600 mb-4">
+                            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 13v-1m4 1v-3m4 3V8m-1 8h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        </div>
+                        <h4 class="text-xl font-semibold text-indigo-900 mb-3">Holistic Nutrition Plans</h4>
+                        <p class="text-gray-600">Guidance on healthy eating that respects local Kenyan cuisine and budget, ensuring sustainable weight loss and improved energy levels.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Testimonials & Trust Section -->
+            <section class="py-16 bg-indigo-50 rounded-2xl">
+                <h3 class="text-4xl font-extrabold text-indigo-900 text-center mb-12">Hear From Our Community</h3>
+                <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6 max-w-6xl mx-auto">
+                    <!-- Testimonial 1 -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-l-4 border-teal-500">
+                        <p class="text-gray-700 italic mb-4">"After struggling with my weight for years, the personalized plan from NK-N changed everything. The trainers are highly professional and supportive. Asanteni sana!"</p>
+                        <p class="font-semibold text-indigo-600">- Jane Wanjiru, Nairobi</p>
+                    </div>
+                    <!-- Testimonial 2 -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-l-4 border-teal-500">
+                        <p class="text-gray-700 italic mb-4">"The group classes are energetic and inclusive. I never feel judged, and the M-Pesa payment option makes membership seamless. Best fitness centre in Mombasa Road!"</p>
+                        <p class="font-semibold text-indigo-600">- David Ochieng, Mombasa</p>
+                    </div>
+                    <!-- Testimonial 3 -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-l-4 border-teal-500">
+                        <p class="text-gray-700 italic mb-4">"My trainer customized my diet to incorporate local foods. It wasn't just a diet, it was a lifestyle change. Highly recommend NK-N for holistic wellness."</p>
+                        <p class="font-semibold text-indigo-600">- Sarah Koech, Eldoret</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Blog/Resources Section -->
+            <section id="blog-section" class="py-16">
+                <h3 class="text-4xl font-extrabold text-indigo-900 text-center mb-12">Latest Health & Fitness Insights</h3>
+                <div class="grid md:grid-cols-3 gap-8">
+                    <!-- Blog Post 1 -->
+                    <article class="bg-white rounded-xl shadow-lg overflow-hidden">
+                        <div class="h-48 bg-gray-200 flex items-center justify-center text-gray-500 font-medium">Image: Local Running Trails</div>
+                        <div class="p-6">
+                            <span class="text-sm text-teal-500 font-medium">Local Wellness</span>
+                            <h4 class="text-xl font-semibold text-indigo-900 mt-2 mb-3">Mastering the Hills: Best Running Routes in Kenya</h4>
+                            <p class="text-gray-600 text-sm line-clamp-3">Discover the top high-altitude training spots and trail running challenges perfect for every Kenyan runner...</p>
+                            <a href="#" class="mt-4 inline-block text-indigo-600 font-medium hover:text-teal-500">Read More &rarr;</a>
+                        </div>
+                    </article>
+                    <!-- Blog Post 2 -->
+                    <article class="bg-white rounded-xl shadow-lg overflow-hidden">
+                        <div class="h-48 bg-gray-200 flex items-center justify-center text-gray-500 font-medium">Image: Nutrition Guide</div>
+                        <div class="p-6">
+                            <span class="text-sm text-teal-500 font-medium">Nutrition</span>
+                            <h4 class="text-xl font-semibold text-indigo-900 mt-2 mb-3">Ugali, Sukuma, and Macros: Eating Healthy on a Budget</h4>
+                            <p class="text-gray-600 text-sm line-clamp-3">We break down how to optimize your favorite Kenyan staples for protein and essential nutrients...</p>
+                            <a href="#" class="mt-4 inline-block text-indigo-600 font-medium hover:text-teal-500">Read More &rarr;</a>
+                        </div>
+                    </article>
+                    <!-- Blog Post 3 -->
+                    <article class="bg-white rounded-xl shadow-lg overflow-hidden">
+                        <div class="h-48 bg-gray-200 flex items-center justify-center text-gray-500 font-medium">Image: Trainer Profile</div>
+                        <div class="p-6">
+                            <span class="text-sm text-teal-500 font-medium">Training Tips</span>
+                            <h4 class="text-xl font-semibold text-indigo-900 mt-2 mb-3">Quick Wins: 15-Minute Home Workouts for Busy Days</h4>
+                            <p class="text-gray-600 text-sm line-clamp-3">No time? No problem. Our head trainer shares his top bodyweight circuits you can do anywhere in Kenya...</p>
+                            <a href="#" class="mt-4 inline-block text-indigo-600 font-medium hover:text-teal-500">Read More &rarr;</a>
+                        </div>
+                    </article>
+                </div>
+            </section>
+
+            <!-- Contact & CTA Footer Section -->
+            <section id="contact" class="py-16 bg-indigo-800 text-white rounded-2xl mt-16 shadow-2xl">
+                <div class="max-w-4xl mx-auto text-center">
+                    <h3 class="text-4xl font-extrabold text-teal-400 mb-4">Ready to Start Your Journey?</h3>
+                    <p class="text-indigo-200 text-lg mb-8">Connect with us today and take the first step towards a healthier, stronger you. We are ready to help!</p>
+                    
+                    <div class="flex flex-col sm:flex-row justify-center space-y-4 sm:space-y-0 sm:space-x-6">
+                        <button onclick="alert('Contact Form opened!')" class="bg-teal-500 text-white py-3 px-8 rounded-full text-lg font-bold hover:bg-teal-600 transition duration-300 shadow-xl">
+                            Send an Inquiry
+                        </button>
+                        <a href="tel:+254700000000" class="border border-indigo-400 text-indigo-100 py-3 px-8 rounded-full text-lg font-bold hover:bg-indigo-700 transition duration-300">
+                            Call Us: +254 (0)759500240
+                        </a>
+                    </div>
+                    <p class="text-sm text-indigo-300 mt-8">Secure payments accepted via **M-Pesa** and major cards.</p>
+                </div>
+            </section>
+        </div>
+
+        <!-- Client Dashboard View (Secure/Dynamic Content) -->
+        <div id="dashboard-view" class="hidden min-h-screen">
+            <header class="bg-indigo-700 text-white p-6 rounded-t-xl shadow-lg">
+                <h2 class="text-3xl font-bold tracking-tight mb-2">My NK-N Dashboard</h2>
+                <p class="text-indigo-200">Welcome back, champion. Track your progress and manage your account.</p>
+                <p class="text-xs text-indigo-400 mt-1" id="user-id-display">User ID: loading...</p>
+            </header>
+            
+            <div class="grid lg:grid-cols-3 gap-8 py-8">
+                <!-- Left Column: Progress Logging & Account Management -->
+                <div class="lg:col-span-1 space-y-8">
+                    
+                    <!-- Progress Logging Form -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-t-4 border-teal-500">
+                        <h3 class="text-xl font-semibold text-indigo-900 mb-4">Log Your Progress</h3>
+                        <form id="progress-form" onsubmit="event.preventDefault(); logProgress(document.getElementById('weight').value, document.getElementById('note').value);">
+                            <div class="mb-4">
+                                <label for="weight" class="block text-sm font-medium text-gray-700 mb-1">Current Weight (kg)</label>
+                                <input type="number" id="weight" step="0.1" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" placeholder="e.g., 75.5">
+                            </div>
+                            <div class="mb-4">
+                                <label for="note" class="block text-sm font-medium text-gray-700 mb-1">Session Notes (Optional)</label>
+                                <textarea id="note" rows="3" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" placeholder="e.g., Felt great after cardio, focused on form..."></textarea>
+                            </div>
+                            <button type="submit" class="w-full bg-teal-500 text-white py-3 rounded-full font-semibold hover:bg-teal-600 transition duration-300 shadow-md">
+                                Save Progress
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Account Summary -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-t-4 border-indigo-500">
+                        <h3 class="text-xl font-semibold text-indigo-900 mb-4">Account & Payments</h3>
+                        <p class="text-sm text-gray-600 mb-2">Membership Status: <span class="font-bold text-green-600">Active - Gold Tier</span></p>
+                        <p class="text-sm text-gray-600 mb-4">Next Payment: KES 14,999 on 1st Dec (via M-Pesa)</p>
+                        <button onclick="alert('Redirecting tofu secure payment portal.')" class="w-ll bg-indigo-100 text-indigo-600 py-2 rounded-full font-semibold text-sm hover:bg-indigo-200 transition duration-300">
+                            Manage Billing Details
+                        </button>
+                    </div>
+
+                    <!-- Trainer Contact -->
+                     <div class="bg-white p-6 rounded-xl shadow-lg border-t-4 border-indigo-500">
+                        <h3 class="text-xl font-semibold text-indigo-900 mb-4">Your Trainer</h3>
+                        <div class="flex items-center space-x-4">
+                            <div class="w-12 h-12 bg-gray-300 rounded-full flex-shrink-0"></div>
+                            <div>
+                                <p class="font-semibold text-indigo-600">Coach NDIEMA NIMROD</p>
+                                <p class="text-sm text-gray-500">Specialty: Strength & Endurance</p>
+                            </div>
+                        </div>
+                        <button onclick="alert('Opening secure chat window with Coach Ken.')" class="mt-4 w-full bg-indigo-600 text-white py-2 rounded-full font-semibold text-sm hover:bg-indigo-700 transition duration-300">
+                            Message Your Trainer
+                        </button>
+                    </div>
+
+                </div>
+
+                <!-- Right Column: Progress Logs & Resources -->
+                <div class="lg:col-span-2 space-y-8">
+                    <!-- Progress History -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg">
+                        <h3 class="text-xl font-semibold text-indigo-900 mb-4 flex justify-between items-center">
+                            Progress History
+                            <span class="text-sm text-gray-500">Real-time data from Firestore</span>
+                        </h3>
+                        <div id="progress-logs" class="max-h-96 overflow-y-auto pr-2">
+                            <p class="text-gray-500 italic">Loading progress history...</p>
+                        </div>
+                    </div>
+
+                    <!-- Exclusive Resources -->
+                    <div class="bg-white p-6 rounded-xl shadow-lg">
+                        <h3 class="text-xl font-semibold text-indigo-900 mb-4">Exclusive Resources</h3>
+                        <ul class="space-y-3">
+                            <li class="p-3 bg-teal-50 rounded-lg border border-teal-200 flex justify-between items-center">
+                                <span class="font-medium text-teal-700">Gold Tier Workout Plan (PDF)</span>
+                                <a href="#" onclick="alert('Downloading Gold Plan')" class="text-sm text-indigo-600 hover:text-teal-500 font-medium">Download</a>
+                            </li>
+                            <li class="p-3 bg-teal-50 rounded-lg border border-teal-200 flex justify-between items-center">
+                                <span class="font-medium text-teal-700">Kenyan Meal Prep Video Guide</span>
+                                <a href="#" onclick="alert('Playing Video')" class="text-sm text-indigo-600 hover:text-teal-500 font-medium">Watch Now</a>
+                            </li>
+                            <li class="p-3 bg-teal-50 rounded-lg border border-teal-200 flex justify-between items-center">
+                                <span class="font-medium text-teal-700">Achieving Consistency E-Book</span>
+                                <a href="#" onclick="alert('Downloading E-Book')" class="text-sm text-indigo-600 hover:text-teal-500 font-medium">Download</a>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </main>
+    
+    <!-- Footer -->
+    <footer class="bg-indigo-900 text-white mt-16 py-10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid md:grid-cols-4 gap-8">
+            <!-- Brand Info -->
+            <div>
+                <h4 class="text-xl font-bold text-teal-400 mb-4">NK-N Fitness Kenya</h4>
+                <p class="text-sm text-indigo-200">Empowering lifelong health and vitality across Kenya.</p>
+                <p class="text-sm text-indigo-200 mt-4">&copy; 2025 NK-N Health. All rights reserved.</p>
+            </div>
+            
+            <!-- Quick Links -->
+            <div>
+                <h4 class="text-lg font-semibold mb-4">Quick Links</h4>
+                <ul class="space-y-2 text-sm">
+                    <li><a href="#services" class="text-indigo-200 hover:text-teal-400 transition">Our Services</a></li>
+                    <li><a href="#blog-section" class="text-indigo-200 hover:text-teal-400 transition">Read Our Blog</a></li>
+                    <li><a href="#" class="text-indigo-200 hover:text-teal-400 transition" onclick="toggleView('dashboard'); window.location.hash = '#dashboard';">Client Login</a></li>
+                    <li><a href="#" class="text-indigo-200 hover:text-teal-400 transition">Privacy Policy</a></li>
+                </ul>
+            </div>
+
+            <!-- Contact -->
+            <div>
+                <h4 class="text-lg font-semibold mb-4">Connect with Us</h4>
+                <ul class="space-y-2 text-sm text-indigo-200">
+                    <li><a href="mailto:info@nknfitness.co.ke" class="hover:text-teal-400 transition">Email: info@nknfitness.co.ke</a></li>
+                    <li>Phone: +254 (0)759500240</li>
+                    <li>Location: Racecourse, Eldoret, Kenya</li>
+                </ul>
+            </div>
+            
+            <!-- Social Media & App Links -->
+            <div>
+                <h4 class="text-lg font-semibold mb-4">Follow Us</h4>
+                <div class="flex space-x-4">
+                    <a href="https://facebook.com" target="_blank" class="text-indigo-200 hover:text-teal-400 transition"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M14 13.5h2.5l1-4H14v-2c0-1.03 0-2 .27-2.7a2.5 2.5 0 012.73-2.3H19V.5s-1.8-.3-3.6-.3c-3.7 0-6.4 2.3-6.4 6.6V10H6.5v4H9v7.5h5V13.5z"/></svg></a>
+                    <a href="https://instagram.com" target="_blank" class="text-indigo-200 hover:text-teal-400 transition"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2c2.72 0 3.06.01 4.12.06 1.05.05 1.7.22 2.37.49.68.27 1.25.63 1.83 1.21.58.58.94 1.15 1.21 1.83.27.67.44 1.32.49 2.37.05 1.06.06 1.4.06 4.12s-.01 3.06-.06 4.12c-.05 1.05-.22 1.7-.49 2.37-.27.68-.63 1.25-1.21 1.83-.58.58-1.15.94-1.83 1.21-.67.27-1.32.44-2.37.49-1.06.05-1.4.06-4.12.06s-3.06-.01-4.12-.06c-1.05-.05-1.7-.22-2.37-.49-.68-.27-1.25-.63-1.83-1.21-.58-.58-.94-1.15-1.21-1.83-.27-.67-.44-1.32-.49-2.37-.05-1.06-.06-1.4-.06-4.12s.01-3.06.06-4.12c.05-1.05.22-1.7.49-2.37.27-.68.63-1.25 1.21-1.83.58-.58 1.15-.94 1.83-1.21.67-.27 1.32-.44 2.37-.49C8.94 2.01 9.28 2 12 2zm0 2c-2.6 0-2.91.01-3.92.06-1 .05-1.44.2-1.88.37-.44.17-.79.37-1.1.68-.31.31-.51.66-.68 1.1-.17.44-.32.88-.37 1.88-.05 1-.06 1.32-.06 3.92s.01 2.91.06 3.92c.05 1 .2 1.44.37 1.88.17.44.37.79.68 1.1.31.31.66.51 1.1.68.44.17.88.32 1.88.37 1 .05 1.32.06 3.92.06s2.91-.01 3.92-.06c1-.05 1.44-.2 1.88-.37.44-.17.79-.37 1.1-.68.31-.31.51-.66.68-1.1.17-.44.32-.88.37-1.88.05-1 .06-1.32.06-3.92s-.01-2.91-.06-3.92c-.05-1-.2-1.44-.37-1.88-.17-.44-.37-.79-.68-1.1-.31-.31-.66-.51-1.1-.68-.44-.17-.88-.32-1.88-.37C14.91 4.01 14.6 4 12 4zm0 3a5 5 0 110 10 5 5 0 010-10zm0 2a3 3 0 100 6 3 3 0 000-6zm6.5-1.5a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z"/></svg></a>
+                    <a href="https://twitter.com" target="_blank" class="text-indigo-200 hover:text-teal-400 transition"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2.222c-5.46 0-9.89 4.43-9.89 9.89 0 4.34 2.8 8.01 6.7 9.32a9.7 9.7 0 00-3.32-1.07c.8-.18 1.63-.35 2.47-.53-.78-1.2-1.25-2.6-1.25-4.14 0-1.8.84-3.4 2.19-4.5-1.07-.3-2.18-.45-3.32-.45-1.5 0-3 .38-4.32 1.07-.57.28-1.13.56-1.68.85 0-2.95 1.9-5.46 4.6-6.38C6.9 7.6 7.4 8 8 8c.6 0 1.1-.4 1.4-1.1.3-1 .45-2.05.45-3.15 0-1.1-.09-2.2-.27-3.25C9.7 1.77 10.84 1.1 12 1.1c2.14 0 4.05 1.38 4.7 3.4.15.48.27 1.02.35 1.58.15.53.3 1.07.4 1.62.1.55.2 1.08.27 1.65.1 1 .15 2.05.15 3.15 0 1.54-.47 3-1.25 4.14.84.18 1.67.35 2.47.53A9.7 9.7 0 0021.78 12c0-5.46-4.43-9.89-9.89-9.89z"/></svg></a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Script to dynamically render auth buttons -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const updateAuthButtons = () => {
+                const dashboardBtn = document.getElementById('dashboard-btn');
+                const signoutBtn = document.getElementById('signout-btn');
+                
+                // Check if Firebase auth has initialized and we have a user (not guest, assuming successful sign-in)
+                const isAuthenticated = typeof userId !== 'undefined' && userId !== 'loading' && userId !== 'guest';
+
+                if (isAuthenticated) {
+                    dashboardBtn.classList.remove('hidden');
+                    signoutBtn.classList.remove('hidden');
+                } else {
+                    dashboardBtn.classList.add('hidden');
+                    signoutBtn.classList.add('hidden');
+                }
+            };
+
+            // Listener for when userId is updated by the Firebase script
+            const observer = new MutationObserver(updateAuthButtons);
+            observer.observe(document.getElementById('firebase-status'), { childList: true, characterData: true, subtree: true });
+
+            // Initial check
+            updateAuthButtons();
+        });
+    </script>
+</body>
+</html>
