@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NKN FITNESS KENYA - Client Manager</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, setDoc, deleteDoc, onSnapshot, collection, query, orderBy, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Set Firebase logging level for debugging (optional but useful)
+        setLogLevel('Debug');
+        
+        // --- GLOBAL SETUP ---
+        // These variables are provided by the canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+
+        // Ensure firebaseConfig is valid before initialization
+        if (Object.keys(firebaseConfig).length > 0) {
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            window.db = db; // Make DB available globally for other scripts
+            window.auth = auth;
+        } else {
+            console.error("Firebase Configuration is missing or invalid.");
+        }
+
+        const CLIENTS_COLLECTION_PATH = `artifacts/${appId}/public/data/nkn_clients`;
+
+        /**
+         * Converts Firestore timestamp or JS Date to a readable date string.
+         * @param {object} timestamp - Firestore Timestamp object
+         * @returns {string} Formatted date string (YYYY-MM-DD)
+         */
+        const formatDate = (timestamp) => {
+            const date = timestamp?.toDate ? timestamp.toDate() : new Date(timestamp);
+            return date.toISOString().split('T')[0];
+        };
+
+        /**
+         * Renders the list of clients in the UI.
+         * @param {Array<Object>} clients - Array of client data.
+         */
+        const renderClients = (clients) => {
+            const listContainer = document.getElementById('client-list');
+            const totalClientsEl = document.getElementById('total-clients');
+            if (!listContainer || !totalClientsEl) return;
+
+            totalClientsEl.textContent = clients.length;
+            listContainer.innerHTML = ''; // Clear existing list
+
+            if (clients.length === 0) {
+                listContainer.innerHTML = `
+                    <tr class="bg-white border-b hover:bg-gray-50">
+                        <td colspan="6" class="px-6 py-4 text-center text-gray-500">
+                            No clients yet! Click "Add New Client" to start managing your fitness empire.
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            // Sort clients by name alphabetically
+            clients.sort((a, b) => a.name.localeCompare(b.name));
+
+            clients.forEach(client => {
+                const row = document.createElement('tr');
+                row.className = 'bg-white border-b hover:bg-gray-50 transition duration-150';
+
+                // Status badge styling
+                let statusClass = '';
+                switch (client.status) {
+                    case 'Active':
+                        statusClass = 'bg-green-100 text-green-800';
+                        break;
+                    case 'On Hold':
+                        statusClass = 'bg-yellow-100 text-yellow-800';
+                        break;
+                    case 'Completed':
+                        statusClass = 'bg-blue-100 text-blue-800';
+                        break;
+                    case 'Inactive':
+                        statusClass = 'bg-red-100 text-red-800';
+                        break;
+                    default:
+                        statusClass = 'bg-gray-100 text-gray-800';
+                }
+
+                row.innerHTML = `
+                    <td class="px-6 py-4 font-medium text-gray-900 whitespace-nowrap">
+                        ${client.name}
+                    </td>
+                    <td class="px-6 py-4">
+                        ${client.goal || 'N/A'}
+                    </td>
+                    <td class="px-6 py-4">
+                        ${formatDate(client.startDate)}
+                    </td>
+                    <td class="px-6 py-4">
+                        <span class="inline-flex items-center px-3 py-1 text-xs font-semibold rounded-full ${statusClass}">
+                            ${client.status}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 text-right">
+                        <button onclick="window.openClientModal('${client.id}', '${client.name}', '${client.goal}', '${formatDate(client.startDate)}', '${client.status}')"
+                            class="font-medium text-indigo-600 hover:text-indigo-900 transition-colors mr-2">
+                            Edit
+                        </button>
+                        <button onclick="window.deleteClient('${client.id}', '${client.name}')"
+                            class="font-medium text-red-600 hover:text-red-900 transition-colors">
+                            Delete
+                        </button>
+                    </td>
+                `;
+                listContainer.appendChild(row);
+            });
+        };
+
+        // --- AUTHENTICATION SETUP ---
+        if (auth) {
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('user-id').textContent = userId;
+                    isAuthReady = true;
+                    console.log("Authentication successful. User ID:", userId);
+                    // Start listening to data once authenticated
+                    setupRealtimeListener();
+                } else {
+                    // Attempt to sign in using the custom token or anonymously
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Firebase Auth failed:", error);
+                        isAuthReady = true; // Still set true to prevent infinite loading state
+                    }
+                }
+            });
+        }
+        
+        /**
+         * Sets up the real-time listener for the clients collection.
+         */
+        const setupRealtimeListener = () => {
+            if (!db || !isAuthReady) return;
+
+            const q = collection(db, CLIENTS_COLLECTION_PATH);
+            
+            // Use onSnapshot for real-time updates
+            onSnapshot(q, (snapshot) => {
+                const clients = [];
+                snapshot.forEach((doc) => {
+                    // Attach the Firestore document ID to the client object
+                    clients.push({ id: doc.id, ...doc.data() });
+                });
+                renderClients(clients);
+            }, (error) => {
+                console.error("Error listening to client data:", error);
+            });
+        };
+
+        // --- CRUD FUNCTIONS ---
+
+        /**
+         * Shows the custom confirmation modal.
+         * @param {string} message - The message to display.
+         * @param {function} onConfirm - Function to run on confirmation.
+         */
+        const showConfirmModal = (message, onConfirm) => {
+            const modal = document.getElementById('confirm-modal');
+            const messageEl = document.getElementById('confirm-message');
+            const confirmBtn = document.getElementById('confirm-action-btn');
+            
+            messageEl.textContent = message;
+            
+            // Clear previous listeners
+            confirmBtn.onclick = null;
+
+            // Set new listener
+            confirmBtn.onclick = () => {
+                onConfirm();
+                modal.classList.add('hidden');
+            };
+
+            // Show modal
+            modal.classList.remove('hidden');
+        };
+
+        /**
+         * Global function to delete a client, exposed to window for inline HTML onclick.
+         * @param {string} clientId - The ID of the client document.
+         * @param {string} clientName - The name of the client for confirmation message.
+         */
+        window.deleteClient = (clientId, clientName) => {
+            showConfirmModal(`Are you sure you want to permanently delete client: ${clientName}?`, async () => {
+                if (!db) return console.error("Database not initialized.");
+                const clientDocRef = doc(db, CLIENTS_COLLECTION_PATH, clientId);
+                try {
+                    await deleteDoc(clientDocRef);
+                    showToast('Client deleted successfully!', 'success');
+                } catch (error) {
+                    console.error("Error deleting client: ", error);
+                    showToast('Failed to delete client.', 'error');
+                }
+            });
+        };
+
+        /**
+         * Handles form submission for adding or updating a client.
+         * @param {Event} e - The form submission event.
+         */
+        window.handleClientSubmit = async (e) => {
+            e.preventDefault();
+            if (!db) return console.error("Database not initialized.");
+
+            const form = e.target;
+            const clientId = form.dataset.clientId;
+            const name = form.name.value.trim();
+            const goal = form.goal.value.trim();
+            const startDate = form.startDate.value;
+            const status = form.status.value;
+
+            if (!name || !startDate) {
+                showToast('Name and Start Date are required.', 'error');
+                return;
+            }
+
+            const clientData = {
+                name,
+                goal,
+                startDate: new Date(startDate), // Save as Date object for Firestore
+                status,
+                // Add an updated timestamp for tracking
+                updatedAt: new Date(), 
+            };
+
+            try {
+                if (clientId) {
+                    // UPDATE existing client
+                    const clientDocRef = doc(db, CLIENTS_COLLECTION_PATH, clientId);
+                    await setDoc(clientDocRef, clientData, { merge: true });
+                    showToast('Client updated successfully!', 'success');
+                } else {
+                    // ADD new client
+                    // Add a createdAt timestamp for new clients
+                    clientData.createdAt = new Date(); 
+                    await addDoc(collection(db, CLIENTS_COLLECTION_PATH), clientData);
+                    showToast('New client added successfully!', 'success');
+                }
+                closeClientModal();
+            } catch (error) {
+                console.error("Error writing document: ", error);
+                showToast(`Failed to save client: ${error.message}`, 'error');
+            }
+        };
+
+        // --- MODAL & TOAST FUNCTIONS ---
+
+        /**
+         * Global function to open the client management modal.
+         * @param {string} [id] - Client ID for editing (optional).
+         * @param {string} [name] - Client Name.
+         * @param {string} [goal] - Client Goal.
+         * @param {string} [startDate] - Client Start Date (YYYY-MM-DD).
+         * @param {string} [status] - Client Status.
+         */
+        window.openClientModal = (id = '', name = '', goal = '', startDate = '', status = 'Active') => {
+            const modal = document.getElementById('client-modal');
+            const form = document.getElementById('client-form');
+            const titleEl = document.getElementById('modal-title');
+            
+            // Set form data attributes and fields
+            form.dataset.clientId = id;
+            titleEl.textContent = id ? 'Edit Client' : 'Add New Client';
+            form.name.value = name;
+            form.goal.value = goal;
+            form.startDate.value = startDate;
+            form.status.value = status;
+            
+            // Show modal
+            modal.classList.remove('opacity-0', 'pointer-events-none');
+            modal.classList.add('opacity-100');
+        };
+
+        /**
+         * Closes the client management modal.
+         */
+        window.closeClientModal = () => {
+            const modal = document.getElementById('client-modal');
+            const form = document.getElementById('client-form');
+            form.reset();
+            form.dataset.clientId = '';
+            
+            // Hide modal
+            modal.classList.add('opacity-0', 'pointer-events-none');
+            modal.classList.remove('opacity-100');
+        };
+
+        /**
+         * Displays a temporary toast notification.
+         * @param {string} message - The message to display.
+         * @param {'success'|'error'} type - The type of message.
+         */
+        const showToast = (message, type) => {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.remove('hidden', 'bg-green-500', 'bg-red-500');
+            
+            if (type === 'success') {
+                toast.classList.add('bg-green-500');
+            } else {
+                toast.classList.add('bg-red-500');
+            }
+            
+            // Show with animation
+            toast.classList.remove('translate-y-full');
+            toast.classList.add('translate-y-0');
+
+            setTimeout(() => {
+                // Hide with animation
+                toast.classList.remove('translate-y-0');
+                toast.classList.add('translate-y-full');
+                setTimeout(() => {
+                    toast.classList.add('hidden');
+                }, 500); // Wait for the transition to finish before adding 'hidden'
+            }, 3000); // Display time
+        };
+
+        // Expose functions globally for HTML access
+        window.showToast = showToast;
+        window.setupRealtimeListener = setupRealtimeListener;
+    </script>
+    <style>
+        /* Custom styles and Tailwind config override */
+        @layer base {
+            html {
+                font-family: 'Inter', sans-serif;
+            }
+        }
+        /* Style for the modal backdrop */
+        .modal-backdrop {
+            background-color: rgba(0, 0, 0, 0.7);
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen p-4 sm:p-8">
+
+    <!-- Toast Notification -->
+    <div id="toast" class="hidden fixed bottom-5 left-1/2 transform -translate-x-1/2 translate-y-full transition-all duration-500 ease-out z-50 p-4 rounded-xl shadow-2xl text-white font-semibold text-sm">
+        Operation successful.
+    </div>
+    
+    <!-- Header/Branding -->
+    <header class="text-center mb-8">
+        <h1 class="text-4xl sm:text-5xl font-extrabold text-gray-800 tracking-tight">
+            NKN <span class="text-green-600">FITNESS</span> KENYA
+        </h1>
+        <p class="text-xl text-gray-500 mt-2">Client Management Dashboard</p>
+        <p class="text-xs text-gray-400 mt-1">
+            <span class="font-mono">User ID: <span id="user-id" class="text-gray-600 break-all">Initializing...</span></span>
+        </p>
+    </header>
+
+    <!-- Main Content Card -->
+    <div class="max-w-7xl mx-auto bg-white shadow-xl rounded-2xl p-4 sm:p-8">
+
+        <!-- Dashboard Metrics -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <!-- Total Clients Card -->
+            <div class="bg-indigo-600 text-white p-6 rounded-xl shadow-lg transform transition duration-300 hover:scale-[1.02]">
+                <p class="text-sm font-medium opacity-80">Total Clients Managed</p>
+                <p id="total-clients" class="text-4xl font-bold mt-1">0</p>
+            </div>
+            <!-- Potential for other metrics (e.g., Active Clients, Revenue Goal) -->
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <p class="text-sm font-medium text-gray-500">Active Clients</p>
+                <p class="text-3xl font-bold text-gray-900 mt-1">
+                    <span class="text-green-500">Real-time</span>
+                </p>
+                <p class="text-xs text-gray-400 mt-1">Reflects current data status.</p>
+            </div>
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <p class="text-sm font-medium text-gray-500">Business Success Tip</p>
+                <p class="text-xl font-bold text-gray-900 mt-1">
+                    Consistency is Key!
+                </p>
+                <p class="text-xs text-gray-400 mt-1">Track client progress actively.</p>
+            </div>
+        </div>
+
+        <!-- Client List Header -->
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 border-b pb-4">
+            <h2 class="text-2xl font-semibold text-gray-700 mb-4 sm:mb-0">Client Registry</h2>
+            <button onclick="window.openClientModal()"
+                class="bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-6 rounded-xl shadow-md transition duration-300 ease-in-out transform hover:-translate-y-0.5 focus:outline-none focus:ring-4 focus:ring-green-500/50 w-full sm:w-auto">
+                + Add New Client
+            </button>
+        </div>
+
+        <!-- Client Table -->
+        <div class="overflow-x-auto relative shadow-md sm:rounded-xl">
+            <table class="w-full text-sm text-left text-gray-500">
+                <thead class="text-xs text-gray-700 uppercase bg-gray-50">
+                    <tr>
+                        <th scope="col" class="py-3 px-6">Client Name</th>
+                        <th scope="col" class="py-3 px-6 hidden sm:table-cell">Primary Goal</th>
+                        <th scope="col" class="py-3 px-6">Start Date</th>
+                        <th scope="col" class="py-3 px-6">Status</th>
+                        <th scope="col" class="py-3 px-6 text-right">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="client-list">
+                    <!-- Client data will be injected here by JavaScript -->
+                    <tr class="bg-white border-b hover:bg-gray-50">
+                        <td colspan="6" class="px-6 py-4 text-center text-gray-500">
+                            Loading clients...
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <!-- Client Add/Edit Modal (Aesthetic and Responsive) -->
+    <div id="client-modal" class="modal-backdrop fixed inset-0 z-40 flex items-center justify-center opacity-0 pointer-events-none transition-opacity duration-300">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg mx-4 transform scale-100 transition-all duration-300">
+            <div class="p-6">
+                <div class="flex justify-between items-center pb-3 border-b border-gray-200">
+                    <h3 id="modal-title" class="text-2xl font-bold text-gray-800">Add New Client</h3>
+                    <button onclick="window.closeClientModal()" class="text-gray-400 hover:text-gray-600 transition-colors">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <form id="client-form" onsubmit="window.handleClientSubmit(event)" class="pt-4">
+                    <!-- Client Name -->
+                    <div class="mb-4">
+                        <label for="name" class="block text-sm font-medium text-gray-700 mb-1">Client Full Name <span class="text-red-500">*</span></label>
+                        <input type="text" id="name" name="name" required class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition-colors" placeholder="e.g., John Kamau">
+                    </div>
+                    <!-- Primary Goal -->
+                    <div class="mb-4">
+                        <label for="goal" class="block text-sm font-medium text-gray-700 mb-1">Primary Fitness Goal</label>
+                        <input type="text" id="goal" name="goal" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition-colors" placeholder="e.g., Weight loss, Muscle gain">
+                    </div>
+                    <!-- Start Date -->
+                    <div class="mb-4">
+                        <label for="startDate" class="block text-sm font-medium text-gray-700 mb-1">Start Date <span class="text-red-500">*</span></label>
+                        <input type="date" id="startDate" name="startDate" required class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition-colors">
+                    </div>
+                    <!-- Status Dropdown -->
+                    <div class="mb-6">
+                        <label for="status" class="block text-sm font-medium text-gray-700 mb-1">Status</label>
+                        <select id="status" name="status" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition-colors bg-white">
+                            <option value="Active">Active</option>
+                            <option value="On Hold">On Hold</option>
+                            <option value="Completed">Completed Program</option>
+                            <option value="Inactive">Inactive</option>
+                        </select>
+                    </div>
+
+                    <div class="flex justify-end space-x-3">
+                        <button type="button" onclick="window.closeClientModal()" class="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors">
+                            Cancel
+                        </button>
+                        <button type="submit" class="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition-colors shadow-md">
+                            Save Client
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Confirmation Modal (Replaces alert/confirm) -->
+    <div id="confirm-modal" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center hidden transition-opacity duration-300">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-sm mx-4 p-6">
+            <h3 class="text-xl font-bold text-red-600 mb-3">Confirm Action</h3>
+            <p id="confirm-message" class="text-gray-700 mb-6">Are you sure you want to proceed?</p>
+            <div class="flex justify-end space-x-3">
+                <button type="button" onclick="document.getElementById('confirm-modal').classList.add('hidden')" class="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors">
+                    Cancel
+                </button>
+                <button type="button" id="confirm-action-btn" class="px-4 py-2 bg-red-600 text-white font-semibold rounded-lg hover:bg-red-700 transition-colors shadow-md">
+                    Confirm Delete
+                </button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
